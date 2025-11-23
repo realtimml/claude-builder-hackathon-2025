@@ -1,7 +1,12 @@
 import anthropic
-from typing import Dict
+from typing import Dict, List
 import logging
 import base64
+import json
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.enum.text import PP_ALIGN
+import io
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +28,30 @@ class ClaudeService:
     
     def _format_github_data(self, github_data: Dict) -> str:
         """Format GitHub data for Claude prompt"""
-        languages = ", ".join(github_data.get("languages", {}).keys())
-        contributors = ", ".join([c["name"] for c in github_data.get("contributors", [])[:5]])
+        # Safely format languages
+        languages = ", ".join(str(lang) for lang in github_data.get("languages", {}).keys() if lang)
+        if not languages:
+            languages = "Not specified"
+        
+        # Safely format contributors, filtering out None names
+        contributors_list = github_data.get("contributors", [])[:5]
+        contributors = ", ".join(
+            str(c.get("name", c.get("username", "Unknown"))) 
+            for c in contributors_list 
+            if c and (c.get("name") or c.get("username"))
+        )
+        if not contributors:
+            contributors = "Not specified"
+        
+        # Safely format topics
+        topics = ", ".join(str(t) for t in github_data.get("topics", []) if t)
+        if not topics:
+            topics = "None"
+        
+        # Safely format structure
+        structure = ", ".join(str(s) for s in github_data.get("structure", [])[:20] if s)
+        if not structure:
+            structure = "Not specified"
         
         formatted = f"""
 ## GitHub Repository Analysis
@@ -46,10 +73,10 @@ class ClaudeService:
 {contributors}
 
 **Topics/Tags:**
-{", ".join(github_data.get("topics", []))}
+{topics}
 
 **Repository Structure:**
-{", ".join(github_data.get("structure", [])[:20])}
+{structure}
 
 **README Content:**
 {github_data.get("readme", "No README available")[:3000]}
@@ -57,13 +84,27 @@ class ClaudeService:
 **Recent Commits (Sample):**
 """
         
+        # Safely format commits
         for commit in github_data.get("commits", [])[:5]:
-            formatted += f"\n- {commit.get('message', '')} by {commit.get('author', 'Unknown')}"
+            if commit:
+                message = commit.get('message', 'No message')
+                author = commit.get('author', 'Unknown')
+                formatted += f"\n- {message} by {author}"
         
         return formatted
     
     def _format_devpost_data(self, devpost_data: Dict) -> str:
         """Format Devpost data for Claude prompt"""
+        
+        # Safely format built_with
+        built_with = ", ".join(str(tech) for tech in devpost_data.get("built_with", []) if tech)
+        if not built_with:
+            built_with = "Not specified"
+        
+        # Safely format team_members
+        team_members = ", ".join(str(member) for member in devpost_data.get("team_members", []) if member)
+        if not team_members:
+            team_members = "Not specified"
         
         formatted = f"""
 ## Devpost Submission
@@ -72,10 +113,10 @@ class ClaudeService:
 **Tagline:** {devpost_data.get("tagline", "")}
 
 **Built With:**
-{", ".join(devpost_data.get("built_with", []))}
+{built_with}
 
 **Team Members:**
-{", ".join(devpost_data.get("team_members", ["Not specified"]))}
+{team_members}
 
 **Inspiration:**
 {devpost_data.get("inspiration", "Not provided")}
@@ -156,88 +197,70 @@ The presentation should be approximately 10-15 slides and cover the following se
 
 Create this presentation now."""
             
-            # Call Claude with PowerPoint skill
-            response = self.client.beta.messages.create(
+            # Ask Claude to structure the presentation content
+            structure_prompt = prompt + """
+
+Please analyze all the project data and create a structured outline for the presentation.
+Return ONLY a JSON object (no other text) with this exact structure:
+
+{
+  "title": "Project Title",
+  "tagline": "Brief tagline",
+  "slides": [
+    {
+      "title": "Slide Title",
+      "content": ["Bullet point 1", "Bullet point 2", "Bullet point 3"],
+      "notes": "Speaker notes for this slide"
+    }
+  ]
+}
+
+Make sure to include 10-15 slides covering all the sections mentioned above."""
+
+            response = self.client.messages.create(
                 model="claude-sonnet-4-20250514",
                 max_tokens=4096,
-                betas=["skills-2025-10-02"],
-                container={
-                    "skills": [
-                        {
-                            "type": "anthropic",
-                            "skill_id": "pptx",
-                            "version": "latest"
-                        }
-                    ]
-                },
                 messages=[{
                     "role": "user",
-                    "content": prompt
+                    "content": structure_prompt
                 }]
             )
             
             logger.info(f"Claude response received with {len(response.content)} content blocks")
             
-            # Extract the PowerPoint file from the response
-            pptx_data = None
-            
+            # Extract JSON content from Claude's response
+            presentation_structure = None
             for content_block in response.content:
-                logger.info(f"Content block type: {content_block.type}")
-                
-                # Check if this is a tool use block with file output
-                if hasattr(content_block, 'type') and content_block.type == 'tool_use':
-                    logger.info(f"Tool use block found: {content_block.name}")
+                if hasattr(content_block, 'text'):
+                    text = content_block.text
+                    logger.info(f"Received text response ({len(text)} chars)")
                     
-                    # Check if there are any files in the output
-                    if hasattr(content_block, 'output') and content_block.output:
-                        output = content_block.output
-                        logger.info(f"Tool output type: {type(output)}")
-                        
-                        # Handle different output formats
-                        if isinstance(output, dict):
-                            # Check for files in output
-                            if 'files' in output and output['files']:
-                                for file_info in output['files']:
-                                    if file_info.get('name', '').endswith('.pptx'):
-                                        # File content might be base64 encoded
-                                        if 'content' in file_info:
-                                            pptx_data = base64.b64decode(file_info['content'])
-                                            logger.info("Found PPTX file in tool output")
-                                            break
-                        elif isinstance(output, str):
-                            # Try to decode if it's base64
-                            try:
-                                pptx_data = base64.b64decode(output)
-                                logger.info("Decoded PPTX from base64 string")
-                            except:
-                                pass
+                    # Try to extract JSON from the response
+                    try:
+                        # Look for JSON in the text
+                        json_start = text.find('{')
+                        json_end = text.rfind('}') + 1
+                        if json_start >= 0 and json_end > json_start:
+                            json_str = text[json_start:json_end]
+                            presentation_structure = json.loads(json_str)
+                            logger.info("Successfully parsed presentation structure from Claude")
+                            break
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Failed to parse JSON from response: {e}")
+                        # Try the whole text
+                        try:
+                            presentation_structure = json.loads(text)
+                            break
+                        except:
+                            pass
             
-            # If we didn't find the file in tool_use blocks, check for file downloads via beta files API
-            if not pptx_data:
-                logger.info("Attempting to retrieve file via Files API...")
-                
-                # Check response for any file references
-                for content_block in response.content:
-                    if hasattr(content_block, 'type') and content_block.type == 'tool_use':
-                        if hasattr(content_block, 'output'):
-                            output = content_block.output
-                            
-                            # Look for file ID or reference
-                            if isinstance(output, dict) and 'file_id' in output:
-                                file_id = output['file_id']
-                                logger.info(f"Found file ID: {file_id}")
-                                
-                                # Download file using Files API
-                                file_content = self.client.beta.files.content(file_id)
-                                pptx_data = file_content.read()
-                                logger.info("Downloaded PPTX file via Files API")
-                                break
+            if not presentation_structure:
+                logger.error("Could not extract presentation structure from Claude's response")
+                raise ValueError("Failed to get presentation structure from Claude")
             
-            if not pptx_data:
-                # Log the response for debugging
-                logger.error("Could not find PPTX file in response")
-                logger.error(f"Response content blocks: {[str(block) for block in response.content]}")
-                raise ValueError("Failed to extract PowerPoint file from Claude's response. The PowerPoint skill may not have generated a file.")
+            # Create PowerPoint presentation using python-pptx
+            logger.info("Creating PowerPoint presentation...")
+            pptx_data = self._create_powerpoint(presentation_structure)
             
             logger.info(f"Successfully generated presentation ({len(pptx_data)} bytes)")
             return pptx_data
@@ -248,3 +271,64 @@ Create this presentation now."""
         except Exception as e:
             logger.error(f"Error generating presentation: {str(e)}")
             raise ValueError(f"Failed to generate presentation: {str(e)}")
+    
+    def _create_powerpoint(self, structure: Dict) -> bytes:
+        """
+        Create a PowerPoint presentation from structured data
+        
+        Args:
+            structure: Dictionary with title, tagline, and slides
+            
+        Returns:
+            PPTX file content as bytes
+        """
+        prs = Presentation()
+        prs.slide_width = Inches(10)
+        prs.slide_height = Inches(7.5)
+        
+        # Title slide
+        title_slide_layout = prs.slide_layouts[0]
+        slide = prs.slides.add_slide(title_slide_layout)
+        title = slide.shapes.title
+        subtitle = slide.placeholders[1]
+        
+        title.text = structure.get("title", "Hackathon Project")
+        subtitle.text = structure.get("tagline", "")
+        
+        # Content slides
+        for slide_data in structure.get("slides", []):
+            bullet_slide_layout = prs.slide_layouts[1]
+            slide = prs.slides.add_slide(bullet_slide_layout)
+            
+            # Set title
+            title = slide.shapes.title
+            title.text = slide_data.get("title", "")
+            
+            # Add content
+            content_placeholder = slide.placeholders[1]
+            text_frame = content_placeholder.text_frame
+            text_frame.clear()
+            
+            for i, bullet in enumerate(slide_data.get("content", [])):
+                if i == 0:
+                    p = text_frame.paragraphs[0]
+                else:
+                    p = text_frame.add_paragraph()
+                p.text = bullet
+                p.level = 0
+                
+                # Format text
+                for run in p.runs:
+                    run.font.size = Pt(18)
+            
+            # Add speaker notes
+            notes_slide = slide.notes_slide
+            text_frame = notes_slide.notes_text_frame
+            text_frame.text = slide_data.get("notes", "")
+        
+        # Save to bytes
+        pptx_io = io.BytesIO()
+        prs.save(pptx_io)
+        pptx_io.seek(0)
+        
+        return pptx_io.read()
